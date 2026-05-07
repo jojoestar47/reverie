@@ -27,20 +27,6 @@ type Status = 'loading' | 'waiting' | 'live' | 'ended'
 const MIXER_BG       = 'rgba(13,14,22,0.96)'
 const MIXER_BG_PANEL = 'rgba(18,20,30,0.98)'
 
-// AudioContext unlock for Android/iOS
-let _audioCtx: AudioContext | null = null
-function unlockAudioContext() {
-  try {
-    const AC = window.AudioContext || (window as any).webkitAudioContext
-    if (!AC) return
-    if (!_audioCtx) _audioCtx = new AC()
-    if (_audioCtx.state === 'suspended') _audioCtx.resume()
-    const buf = _audioCtx.createBuffer(1, 1, 22050)
-    const src = _audioCtx.createBufferSource()
-    src.buffer = buf; src.connect(_audioCtx.destination); src.start(0)
-  } catch (_) {}
-}
-
 export default function ViewerPage() {
   const params   = useParams()
   const joinCode = (params.joinCode as string).toUpperCase()
@@ -63,7 +49,15 @@ export default function ViewerPage() {
     right:  { zoom: 1, panX: 50, panY: 100, flipped: false, aboveOverlay: false },
   })
 
+  // Skip the character fetch when the JSON-serialized state is unchanged.
+  // The realtime channel fires this on every session UPDATE (handout/overlay/
+  // music too), so without a guard we'd re-fetch all three characters on every
+  // tweak — and the periodic resync poll would do the same every cycle.
+  const lastCharStateKeyRef = useRef<string | null>(null)
   const loadCharactersFromState = useCallback(async (state: CharacterState | null) => {
+    const key = state ? JSON.stringify(state) : ''
+    if (lastCharStateKeyRef.current === key) return
+    lastCharStateKeyRef.current = key
     const seq = ++charLoadSeqRef.current
     if (!state) {
       setCharacters({ left: null, center: null, right: null })
@@ -98,14 +92,12 @@ export default function ViewerPage() {
   // the soundId so a "stop" event from the DM can pause every in-flight
   // playback for that sound.
   const sfxAudioRef           = useRef<Record<string, { audio: HTMLAudioElement; soundId: string }>>({})
-  const hasInteracted         = useRef(false)
   const [volumes, setVolumes] = useState<Record<string, number>>({})
   const [playing, setPlaying] = useState<Record<string, boolean>>({})
   const [muted,   setMuted]   = useState(false)
   const mutedRef = useRef(false)
   useEffect(() => { mutedRef.current = muted }, [muted])
   const [mixerOpen, setMixerOpen] = useState(false)
-  const [needsTap,  setNeedsTap]  = useState(false)
   const [mixerPos, setMixerPos] = useState<'top-left' | 'top-right'>('top-left')
   useEffect(() => {
     const saved = localStorage.getItem('sf_mixer_pos') as 'top-left' | 'top-right' | null
@@ -119,6 +111,9 @@ export default function ViewerPage() {
   useEffect(() => { campaignSoundsRef.current = campaignSounds }, [campaignSounds])
   const lastSfxEventIdRef = useRef<string | null>(null)
   const [sessionCampaignId, setSessionCampaignId] = useState<string | null>(null)
+  // Mirror sessionCampaignId in a ref so loadSession can decide whether to
+  // refetch sounds/handouts without depending on state inside the closure.
+  const sessionCampaignIdRef = useRef<string | null>(null)
 
   // ── Campaign Library (campaign-scoped handouts) ──
   // Players browse these themselves — independent of the DM-pushed handout.
@@ -183,20 +178,10 @@ export default function ViewerPage() {
     }
     a.addEventListener('ended', cleanup)
     a.addEventListener('error', cleanup)
-    // Always attempt — gating on hasInteracted misses the case where the
-    // scene has no tracks (no autoplay attempt is ever made, so the tap
-    // overlay never appears and audio stays locked forever). If play()
-    // rejects because the browser hasn't received a user gesture, surface
-    // the tap overlay so the viewer can unlock audio for future SFX.
-    a.play()
-      .then(() => {
-        hasInteracted.current = true
-        setNeedsTap(false)
-      })
-      .catch(() => {
-        cleanup()
-        if (!hasInteracted.current) setNeedsTap(true)
-      })
+    // play() may reject if the browser hasn't seen a user gesture yet —
+    // the mixer's manual buttons are user gestures, so there's a recovery
+    // path. Silent failure here is preferable to a blocking modal.
+    a.play().catch(() => { cleanup() })
   }, [])
 
   // ── Handout sync ─────────────────────────────────────────────
@@ -219,7 +204,9 @@ export default function ViewerPage() {
   const [activeOverlays, setActiveOverlays] = useState<Record<string, OverlayLiveState>>({})
 
   // ── Spotify player ────────────────────────────────────────────
-  const spotify = useSpotifyPlayer(scene)
+  // preferredTrackId: when the DM has already chosen a track, autoplay it
+  // directly so we don't briefly play music[0] before switching.
+  const spotify = useSpotifyPlayer(scene, { preferredTrackId: activeMusicTrackId })
 
   // ── Fullscreen ────────────────────────────────────────────────
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -327,26 +314,13 @@ export default function ViewerPage() {
     const startId      = activeMusicTrackIdRef.current
     const musicToStart = (startId ? musicTracks.find(t => t.id === startId) : null) ?? musicTracks[0]
     const tracksToPlay = [...(musicToStart ? [musicToStart] : []), ...alwaysOn]
-    if (!tracksToPlay.length) return
-
-    if (hasInteracted.current) {
-      tracksToPlay.forEach(t => {
-        const a = getOrCreate(t)
-        if (a.paused) a.play().catch(() => {})
-      })
-      return
-    }
-    // First-tap path: needs sync user gesture to unlock
-    const first = getOrCreate(tracksToPlay[0])
-    first.play()
-      .then(() => {
-        hasInteracted.current = true; setNeedsTap(false)
-        tracksToPlay.slice(1).forEach(t => {
-          const a = getOrCreate(t)
-          if (a.paused) a.play().catch(() => {})
-        })
-      })
-      .catch(() => { setNeedsTap(true) })
+    // Just attempt — modern browsers allow autoplay after high-engagement
+    // origin status, and the audio mixer's manual play buttons are a user
+    // gesture for browsers that block. Silent failure beats a blocking modal.
+    tracksToPlay.forEach(t => {
+      const a = getOrCreate(t)
+      if (a.paused) a.play().catch(() => {})
+    })
   }, [scene?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Switch music track when DM changes it ─────────────────────
@@ -367,28 +341,12 @@ export default function ViewerPage() {
       // stopAll() resets activeTrackRef inside the hook so toggle always calls playTrack
       spotify.stopAll()
       spotify.toggle(targetTrack)
-    } else if (hasInteracted.current) {
+    } else {
       const a = getOrCreate(targetTrack)
       a.volume = volumes[targetTrack.id] ?? a.volume
       if (a.paused) a.play().catch(() => {})
     }
   }, [activeMusicTrackId]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  function handleFirstTap() {
-    hasInteracted.current = true; setNeedsTap(false)
-    unlockAudioContext()
-    const allMusic    = (scene?.tracks || []).filter(t => t.kind === 'music')
-    const alwaysOn    = (scene?.tracks || []).filter(t => (t.kind === 'ml2' || t.kind === 'ml3' || t.kind === 'ambience') && !t.spotify_uri)
-    const target      = activeMusicTrackId ? allMusic.find(t => t.id === activeMusicTrackId) : null
-    if (target?.spotify_uri) {
-      if (!spotify.states[target.id]?.playing) spotify.toggle(target)
-    } else {
-      const fileMusicToStart = (target ?? allMusic.filter(t => !t.spotify_uri)[0])
-      if (fileMusicToStart) { const a = getOrCreate(fileMusicToStart); if (a.paused) a.play().catch(() => {}) }
-      if (!target) spotify.autoPlay() // no specific track set — let Spotify auto-pick
-    }
-    alwaysOn.forEach(t => { const a = getOrCreate(t); if (a.paused) a.play().catch(() => {}) })
-  }
 
   // ── Load scene ────────────────────────────────────────────────
   const loadScene = useCallback(async (sceneId: string | null, sessionOverlays?: Record<string, OverlayLiveState> | null) => {
@@ -409,6 +367,9 @@ export default function ViewerPage() {
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load session ──────────────────────────────────────────────
+  // Idempotent: safe to call repeatedly (initial mount, visibility resume,
+  // periodic resync). Skips the expensive scene reload when active_scene_id
+  // hasn't changed so a resync doesn't churn audio refs / overlay state.
   const loadSession = useCallback(async () => {
     const { data } = await supabase.from('sessions')
       .select('id, campaign_id, active_scene_id, is_live, character_state, active_handout_id, active_music_track_id, active_overlays, active_sfx_event')
@@ -416,15 +377,21 @@ export default function ViewerPage() {
     if (!data)         { setStatus('waiting'); return }
     if (!data.is_live) { setStatus('ended');   return }
     const sessionOverlays = (data.active_overlays ?? {}) as Record<string, OverlayLiveState>
-    await Promise.all([
-      loadScene(data.active_scene_id, sessionOverlays),
-      loadCharactersFromState(data.character_state as CharacterState | null),
-    ])
+    const sceneChanged = data.active_scene_id !== sceneRef.current?.id
+    if (sceneChanged) {
+      await loadScene(data.active_scene_id, sessionOverlays)
+    } else if (data.active_overlays) {
+      setActiveOverlays(data.active_overlays as Record<string, OverlayLiveState>)
+    }
+    await loadCharactersFromState(data.character_state as CharacterState | null)
     setActiveHandoutId(data.active_handout_id ?? null)
     setActiveMusicTrackId(data.active_music_track_id ?? null)
     // Soundboard + Library: fetch campaign-scoped data so SFX events resolve
-    // and the library button has its handouts ready.
-    if (data.campaign_id) {
+    // and the library button has its handouts ready. Only on first load /
+    // campaign change — the per-campaign realtime subscriptions below keep
+    // these in sync afterward, so the live-resync poll skips this work.
+    if (data.campaign_id && data.campaign_id !== sessionCampaignIdRef.current) {
+      sessionCampaignIdRef.current = data.campaign_id
       setSessionCampaignId(data.campaign_id)
       const [{ data: sounds }, { data: handouts }] = await Promise.all([
         supabase.from('campaign_sounds').select('*').eq('campaign_id', data.campaign_id).order('order_index'),
@@ -444,6 +411,42 @@ export default function ViewerPage() {
   useEffect(() => {
     if (status !== 'waiting') return
     const t = setInterval(loadSession, 6000)
+    return () => clearInterval(t)
+  }, [status, loadSession])
+
+  // Recover from a silently-dropped Realtime channel. When the tab goes
+  // background the websocket can stop receiving postgres_changes events;
+  // resuming the tab or coming back online doesn't always replay the missed
+  // updates. Re-fetch session state on visibility/online so the viewer
+  // catches up without a full reload. This deliberately does NOT touch the
+  // channel subscription (touching it churns the SDK — see #99 revert).
+  // Stable deps via useCallback singleton supabase keep this from re-binding.
+  useEffect(() => {
+    function onResume() {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      loadSession()
+    }
+    function onOnline() { loadSession() }
+    document.addEventListener('visibilitychange', onResume)
+    window.addEventListener('online', onOnline)
+    return () => {
+      document.removeEventListener('visibilitychange', onResume)
+      window.removeEventListener('online', onOnline)
+    }
+  }, [loadSession])
+
+  // Belt-and-suspenders resync while live. The Realtime channel can silently
+  // stall while the tab is foregrounded (server-side disconnect, transient
+  // network blip the SDK doesn't surface). loadSession is now idempotent —
+  // it skips the scene reload + character fetch when nothing changed — so a
+  // 15s poll catches DM scene switches the channel missed without disrupting
+  // playback when state is steady.
+  useEffect(() => {
+    if (status !== 'live') return
+    const t = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      loadSession()
+    }, 15000)
     return () => clearInterval(t)
   }, [status, loadSession])
 
@@ -810,7 +813,11 @@ export default function ViewerPage() {
         )}
       </div>
 
-      {/* Spotify connect prompt — shown when scene has Spotify tracks but player isn't connected */}
+      {/* Spotify connect/reconnect prompt — when scene has Spotify tracks but
+          the SDK isn't ready. Shows "Connect" for first-time auth and
+          "Reconnect" (calls player.connect() — no full re-auth) once we've
+          had a valid session that dropped. lastError surfaces the SDK's own
+          message so disconnects aren't silent. */}
       {hasSpotifyTracks && !spotify.connected && (
         <div style={{ position: 'absolute', bottom: 'calc(20px + env(safe-area-inset-bottom))', left: '50%', transform: 'translateX(-50%)', zIndex: 30, background: MIXER_BG, border: '1px solid rgba(30,215,96,0.3)', borderRadius: '10px', padding: '12px 20px', display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap', justifyContent: 'center', maxWidth: 'calc(100vw - 40px)' }}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="#1ed760"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z" /></svg>
@@ -819,22 +826,19 @@ export default function ViewerPage() {
               Spotify playback isn’t supported on iPhone or iPad. Open this link in Chrome or Safari on a desktop to hear streaming tracks.
             </span>
           ) : (
-            <>
-              <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.7)' }}>This scene has Spotify music</span>
-              <a href="/auth/spotify" style={{ fontSize: '11px', fontWeight: 700, color: '#1ed760', textDecoration: 'none', border: '1px solid rgba(30,215,96,0.5)', borderRadius: 'var(--r-sm)', padding: '4px 10px' }}>Connect Spotify</a>
-            </>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
+              <span style={{ fontSize: '12px', color: 'rgba(255,255,255,0.7)' }}>
+                {spotify.lastError ? 'Spotify disconnected' : 'This scene has Spotify music'}
+              </span>
+              {spotify.lastError && (
+                <span style={{ fontSize: '10px', color: 'rgba(255,85,85,0.7)', maxWidth: '320px', textAlign: 'center' }}>{spotify.lastError}</span>
+              )}
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={() => spotify.reconnect()} style={{ fontSize: '11px', fontWeight: 700, color: '#1ed760', background: 'transparent', border: '1px solid rgba(30,215,96,0.5)', borderRadius: 'var(--r-sm)', padding: '4px 10px', cursor: 'pointer' }}>Reconnect</button>
+                <a href="/auth/spotify" style={{ fontSize: '11px', fontWeight: 700, color: 'rgba(255,255,255,0.6)', textDecoration: 'none', border: '1px solid rgba(255,255,255,0.2)', borderRadius: 'var(--r-sm)', padding: '4px 10px' }}>Re-auth</a>
+              </div>
+            </div>
           )}
-        </div>
-      )}
-
-      {/* Tap to start audio overlay */}
-      {needsTap && (
-        <div onClick={handleFirstTap} style={{ position: 'absolute', inset: 0, zIndex: 40, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', background: 'rgba(7,8,16,0.65)' }}>
-          <div style={{ textAlign: 'center', padding: '28px 36px', background: MIXER_BG, border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', maxWidth: 'calc(100vw - 40px)' }}>
-            <div style={{ fontSize: '52px', marginBottom: '16px' }}>🎵</div>
-            <div style={{ fontFamily: "'Cormorant Garamond',serif", fontSize: '13px', color: 'rgba(255,255,255,0.9)', letterSpacing: '4px', textTransform: 'uppercase', marginBottom: '8px' }}>Tap to Start Audio</div>
-            <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.3)', letterSpacing: '1px' }}>Tap anywhere on this card</div>
-          </div>
         </div>
       )}
 

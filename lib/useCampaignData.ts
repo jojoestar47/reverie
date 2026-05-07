@@ -159,10 +159,26 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
   useEffect(() => { onActiveSceneIdChangeRef.current = opts.onActiveSceneIdChange })
 
   // ── Auth: redirect on sign-out from another tab ──
-  // Without this the page silently continues showing stale data.
+  // Without this the page silently continues showing stale data. We've seen
+  // spurious SIGNED_OUT events (likely a transient 401 during a query that
+  // makes supabase-js drop the session even though the refresh token is
+  // still valid) — when that happens, getSession reports a fresh session a
+  // beat later. Verify before redirecting so a momentary auth blip doesn't
+  // boot the DM mid-action. The console.log helps diagnose recurrences.
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(event => {
-      if (event === 'SIGNED_OUT') onSignedOutRef.current?.()
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      console.log('[auth] event =', event, 'has_session =', !!session)
+      if (event !== 'SIGNED_OUT') return
+      // Brief grace period: if the auth client recovers a session within ~1s,
+      // it was a transient and we shouldn't bounce the user.
+      await new Promise(r => setTimeout(r, 800))
+      const { data: { session: recovered } } = await supabase.auth.getSession()
+      if (recovered) {
+        console.warn('[auth] SIGNED_OUT recovered — staying on page')
+        return
+      }
+      console.warn('[auth] SIGNED_OUT confirmed — redirecting to /login')
+      onSignedOutRef.current?.()
     })
     return () => subscription.unsubscribe()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps

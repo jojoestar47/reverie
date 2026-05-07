@@ -35,6 +35,10 @@ export interface SpotifyPlayerApi {
   // Playback position (0–1) and total duration (ms), polled every 500ms
   progress:   number
   duration:   number
+  // Last error message surfaced by the SDK (auth/init/account/playback) or
+  // null when healthy. Lets the UI show a "Reconnect" prompt with context
+  // instead of a silent disconnect.
+  lastError:  string | null
   toggle:     (t: Track) => void
   setVolume:  (t: Track, val: number) => void
   setLoop:    (t: Track, val: boolean) => void
@@ -42,6 +46,10 @@ export interface SpotifyPlayerApi {
   mute:       (muted: boolean) => void
   autoPlay:   () => void   // call after user interaction (viewer tap-to-start)
   skip:       (direction: 'next' | 'previous') => void
+  // Manual reconnect — re-runs player.connect() which usually re-fires the
+  // 'ready' event without a full re-auth. Falls back to no-op if the SDK
+  // never loaded.
+  reconnect:  () => void
 }
 
 declare global {
@@ -72,10 +80,16 @@ function saveVolume(sceneId: string, trackId: string, volume: number) {
 async function fetchToken(): Promise<string | null> {
   try {
     const res = await fetch('/api/spotify/token')
-    if (!res.ok) return null
+    if (!res.ok) {
+      // 401 = not connected, 429 = rate limited, 5xx = upstream — without
+      // surfacing this every disconnect looks identical to "user pressed stop."
+      console.warn(`[spotify] /api/spotify/token failed: ${res.status} ${res.statusText}`)
+      return null
+    }
     const { access_token } = await res.json()
     return access_token ?? null
-  } catch {
+  } catch (e) {
+    console.warn('[spotify] /api/spotify/token network error:', e)
     return null
   }
 }
@@ -96,7 +110,10 @@ async function applyRepeatMode(
   ).catch(() => {})
 }
 
-export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false } = {}): SpotifyPlayerApi {
+export function useSpotifyPlayer(
+  scene: Scene | null,
+  { disableAutoPlay = false, preferredTrackId = null }: { disableAutoPlay?: boolean; preferredTrackId?: string | null } = {},
+): SpotifyPlayerApi {
   const playerRef      = useRef<SpotifySdkPlayer | null>(null)
   const deviceIdRef    = useRef<string | null>(null)
   const activeTrackRef = useRef<Track | null>(null)
@@ -109,6 +126,7 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
   const pendingPlayRef = useRef<Track | null>(null)
 
   const [connected,   setConnected]   = useState(false)
+  const [lastError,   setLastError]   = useState<string | null>(null)
   const [states,      setStates]      = useState<Record<string, SpotifyTrackState>>({})
   const [nowPlaying,  setNowPlaying]  = useState<SpotifyNowPlaying | null>(null)
   const [progress,    setProgress]    = useState(0)
@@ -149,15 +167,18 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
   // device; if both auto-play on scene change they race — last write wins
   // and the wrong device may end up with audio. The DM can still manually
   // toggle tracks from the mixer.
+  // preferredTrackId lets callers (the viewer) specify the DM-selected track
+  // up-front so we don't briefly play music[0] then switch.
   useEffect(() => {
     if (disableAutoPlay || !connected || !scene?.id) return
     const music = spotifyTracks.filter(
       t => t.kind === 'music' || t.kind === 'ml2' || t.kind === 'ml3'
     )
     if (!music.length) return
-    const timer = setTimeout(() => { playTrack(music[0]).catch(() => {}) }, 350)
+    const target = (preferredTrackId ? music.find(t => t.id === preferredTrackId) : null) ?? music[0]
+    const timer = setTimeout(() => { playTrack(target).catch(() => {}) }, 350)
     return () => clearTimeout(timer)
-  }, [scene?.id, connected, disableAutoPlay]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scene?.id, connected, disableAutoPlay, preferredTrackId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Progress polling (500ms) ──────────────────────────────────
   // player_state_changed alone isn't frequent enough for a smooth bar.
@@ -207,8 +228,10 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
       })
 
       player.addListener('ready', ({ device_id }: { device_id: string }) => {
+        console.log('[spotify] ready, device_id =', device_id)
         deviceIdRef.current = device_id
         setConnected(true)
+        setLastError(null)
         // Flush any play that was requested before the device was ready
         if (pendingPlayRef.current) {
           const queued = pendingPlayRef.current
@@ -217,9 +240,31 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
         }
       })
 
-      player.addListener('not_ready', () => {
+      player.addListener('not_ready', ({ device_id }: { device_id: string }) => {
+        console.warn('[spotify] not_ready, device_id =', device_id, '(SDK lost the device — usually a network blip or the user activating Spotify on another device)')
         deviceIdRef.current = null
         setConnected(false)
+      })
+
+      // Diagnostic listeners — without these, every SDK failure is silent.
+      // Surface them via console + lastError so the UI can prompt to reconnect.
+      const onSdkError = (kind: string) => (e: { message?: string }) => {
+        const msg = e?.message ?? kind
+        console.error(`[spotify] ${kind}:`, msg)
+        setLastError(`${kind}: ${msg}`)
+        if (kind === 'authentication_error' || kind === 'account_error') {
+          setConnected(false)
+        }
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const p = player as any
+      p.addListener('initialization_error',  onSdkError('initialization_error'))
+      p.addListener('authentication_error',  onSdkError('authentication_error'))
+      p.addListener('account_error',         onSdkError('account_error'))
+      p.addListener('playback_error',        onSdkError('playback_error'))
+      p.addListener('autoplay_failed',       () => {
+        console.warn('[spotify] autoplay_failed — browser blocked SDK autoplay; user must click play once')
+        setLastError('autoplay blocked — click play in the mixer')
       })
 
       player.addListener('player_state_changed', (state: SpotifySdkPlayerState | null) => {
@@ -386,5 +431,15 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
     else                      playerRef.current.previousTrack().catch(() => {})
   }
 
-  return { states, connected, unsupported, nowPlaying, progress, duration, toggle, setVolume, setLoop, stopAll, mute, autoPlay, skip }
+  function reconnect() {
+    if (!playerRef.current) {
+      console.warn('[spotify] reconnect: SDK not loaded yet')
+      return
+    }
+    console.log('[spotify] reconnect: calling player.connect()')
+    setLastError(null)
+    playerRef.current.connect()
+  }
+
+  return { states, connected, unsupported, lastError, nowPlaying, progress, duration, toggle, setVolume, setLoop, stopAll, mute, autoPlay, skip, reconnect }
 }
