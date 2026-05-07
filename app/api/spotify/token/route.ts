@@ -1,12 +1,19 @@
 import { NextResponse } from 'next/server'
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
-import { getSpotifyToken } from '@/lib/supabase/spotify-token'
+import { getSpotifyTokenWithExpiry } from '@/lib/supabase/spotify-token'
 
 // ── Rate limiting ─────────────────────────────────────────────
-// 10 token fetches per user per 60 seconds.
+// 60 token fetches per user per 60 seconds. The previous limit (10/min)
+// was too tight for the SDK's natural pattern: one fetch from
+// getOAuthToken on connect, plus one per playTrack via the HTTP API,
+// plus repeats for repeat-mode/skip — DM tab + viewer tab on the same
+// account easily exceeded 10/min and started returning 429s, which then
+// looked like "Spotify won't connect" to the user. The client now also
+// caches the token until ~60s before expiry, so this is mostly a
+// safety net for unusual flows.
 const WINDOW_MS = 60_000
-const MAX_REQS  = 10
+const MAX_REQS  = 60
 const memoryStore = new Map<string, number[]>()
 
 function checkMemoryLimit(userId: string): boolean {
@@ -61,10 +68,12 @@ export async function GET() {
   const allowed = await checkRateLimit(user.id)
   if (!allowed) return NextResponse.json({ error: 'Too many requests' }, { status: 429 })
 
-  const token = await getSpotifyToken(supabase, user.id)
-  if (!token)  return NextResponse.json({ error: 'Not connected' }, { status: 404 })
+  const result = await getSpotifyTokenWithExpiry(supabase, user.id)
+  if (!result)  return NextResponse.json({ error: 'Not connected' }, { status: 404 })
 
-  return NextResponse.json({ access_token: token })
+  // Return expires_at so the client can cache instead of hammering this
+  // endpoint on every play / SDK callback.
+  return NextResponse.json({ access_token: result.access_token, expires_at: result.expires_at })
 }
 
 export async function DELETE() {

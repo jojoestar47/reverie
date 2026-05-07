@@ -77,21 +77,61 @@ function saveVolume(sceneId: string, trackId: string, volume: number) {
 }
 
 // ── Server token fetch ────────────────────────────────────────
-async function fetchToken(): Promise<string | null> {
-  try {
-    const res = await fetch('/api/spotify/token')
-    if (!res.ok) {
-      // 401 = not connected, 429 = rate limited, 5xx = upstream — without
-      // surfacing this every disconnect looks identical to "user pressed stop."
-      console.warn(`[spotify] /api/spotify/token failed: ${res.status} ${res.statusText}`)
-      return null
-    }
-    const { access_token } = await res.json()
-    return access_token ?? null
-  } catch (e) {
-    console.warn('[spotify] /api/spotify/token network error:', e)
+// Module-level cache so every call site (SDK getOAuthToken callback,
+// playTrack, applyRepeatMode, skip) shares one valid token instead of
+// each round-tripping /api/spotify/token. Spotify access tokens are
+// valid for ~1 hour; we honor expires_at minus a 60s buffer.
+//
+// Without this cache, DM + viewer on the same account easily blew past
+// the endpoint's rate limit (the SDK calls getOAuthToken on connect AND
+// every play — multiplied by tabs), which surfaced as "won't connect to
+// Spotify" because token fetch returned null.
+let cachedToken: { access_token: string; expires_at: number } | null = null
+let inFlight: Promise<string | null> | null = null
+
+function readCachedToken(): string | null {
+  if (!cachedToken) return null
+  if (cachedToken.expires_at - 60_000 <= Date.now()) {
+    cachedToken = null
     return null
   }
+  return cachedToken.access_token
+}
+
+async function fetchToken(): Promise<string | null> {
+  const cached = readCachedToken()
+  if (cached) return cached
+  // De-dupe parallel fetches so a burst of playTrack calls only hits the
+  // endpoint once.
+  if (inFlight) return inFlight
+  inFlight = (async () => {
+    try {
+      const res = await fetch('/api/spotify/token')
+      if (!res.ok) {
+        // 401 = not connected, 429 = rate limited, 5xx = upstream — without
+        // surfacing this every disconnect looks identical to "user pressed stop."
+        console.warn(`[spotify] /api/spotify/token failed: ${res.status} ${res.statusText}`)
+        return null
+      }
+      const { access_token, expires_at } = await res.json() as { access_token?: string; expires_at?: string }
+      if (!access_token) return null
+      const expMs = expires_at ? new Date(expires_at).getTime() : Date.now() + 50 * 60_000
+      cachedToken = { access_token, expires_at: expMs }
+      return access_token
+    } catch (e) {
+      console.warn('[spotify] /api/spotify/token network error:', e)
+      return null
+    } finally {
+      inFlight = null
+    }
+  })()
+  return inFlight
+}
+
+// Force the next fetchToken to round-trip — call when the SDK reports an
+// auth error so we don't hand it the same dead token.
+function invalidateCachedToken() {
+  cachedToken = null
 }
 
 // ── Repeat mode helper ────────────────────────────────────────
@@ -254,6 +294,9 @@ export function useSpotifyPlayer(
         setLastError(`${kind}: ${msg}`)
         if (kind === 'authentication_error' || kind === 'account_error') {
           setConnected(false)
+          // Drop the cached token so the next fetch round-trips and we
+          // don't keep handing the SDK the same expired/invalid one.
+          invalidateCachedToken()
         }
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
