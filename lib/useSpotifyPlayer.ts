@@ -183,7 +183,10 @@ export function useSpotifyPlayer(
     if (scene?.id === prevSceneIdRef.current) return
     prevSceneIdRef.current = scene?.id ?? null
 
-    if (playerRef.current) playerRef.current.pause().catch(() => {})
+    // Only pause if we actually loaded something — calling pause() on an
+    // SDK with no list loaded fires a benign but noisy "Cannot perform
+    // operation; no list was loaded" playback_error.
+    if (playerRef.current && activeTrackRef.current) playerRef.current.pause().catch(() => {})
     activeTrackRef.current = null
     setNowPlaying(null)
     setProgress(0)
@@ -290,8 +293,17 @@ export function useSpotifyPlayer(
       // Surface them via console + lastError so the UI can prompt to reconnect.
       const onSdkError = (kind: string) => (e: { message?: string }) => {
         const msg = e?.message ?? kind
-        console.error(`[spotify] ${kind}:`, msg)
-        setLastError(`${kind}: ${msg}`)
+        // "Cannot perform operation; no list was loaded" is the SDK's
+        // response to pause()/skip()/etc. when nothing is loaded — benign
+        // and we already guard against it where we can. Demote to warn so
+        // it doesn't pollute the console as a red error.
+        const benign = kind === 'playback_error' && /no list was loaded/i.test(msg)
+        if (benign) {
+          console.warn(`[spotify] ${kind}: ${msg} (no-op)`)
+        } else {
+          console.error(`[spotify] ${kind}:`, msg)
+          setLastError(`${kind}: ${msg}`)
+        }
         if (kind === 'authentication_error' || kind === 'account_error') {
           setConnected(false)
           // Drop the cached token so the next fetch round-trips and we
@@ -442,7 +454,11 @@ export function useSpotifyPlayer(
   }
 
   function stopAll() {
-    if (playerRef.current) playerRef.current.pause().catch(() => {})
+    // Only pause if a track is loaded. The DM calls stopAll() the moment a
+    // presentation goes live whether or not Spotify was already playing —
+    // an unconditional pause() on an empty SDK fires a noisy
+    // "Cannot perform operation; no list was loaded" error.
+    if (playerRef.current && activeTrackRef.current) playerRef.current.pause().catch(() => {})
     activeTrackRef.current = null
     setNowPlaying(null)
     setProgress(0)

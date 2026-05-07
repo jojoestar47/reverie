@@ -166,8 +166,12 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
   // beat later. Verify before redirecting so a momentary auth blip doesn't
   // boot the DM mid-action. The console.log helps diagnose recurrences.
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log('[auth] event =', event, 'has_session =', !!session)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event) => {
+      // SIGNED_IN, INITIAL_SESSION, USER_UPDATED, TOKEN_REFRESHED all fire
+      // routinely during a healthy session (every token refresh, on every
+      // tab focus). Logging them was useful for the original diagnosis but
+      // is now noise. Only react to SIGNED_OUT; only log when we actually
+      // do something so recurrences are still visible.
       if (event !== 'SIGNED_OUT') return
       // Brief grace period: if the auth client recovers a session within ~1s,
       // it was a transient and we shouldn't bounce the user.
