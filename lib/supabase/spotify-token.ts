@@ -11,6 +11,18 @@ export async function getSpotifyToken(
   supabase: SupabaseClient,
   userId: string
 ): Promise<string | null> {
+  const result = await getSpotifyTokenWithExpiry(supabase, userId)
+  return result?.access_token ?? null
+}
+
+/** Like getSpotifyToken but also returns the absolute expiration timestamp
+ *  so callers (e.g. the /api/spotify/token route) can pass it to the
+ *  browser, letting the client cache the token instead of hammering the
+ *  rate-limited endpoint on every play. */
+export async function getSpotifyTokenWithExpiry(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<{ access_token: string; expires_at: string } | null> {
   const { data } = await supabase
     .from('spotify_tokens')
     .select('access_token, refresh_token, expires_at')
@@ -21,10 +33,19 @@ export async function getSpotifyToken(
 
   // Return cached token if still valid (with 60s buffer)
   if (new Date(data.expires_at).getTime() - 60_000 > Date.now()) {
-    return data.access_token
+    return { access_token: data.access_token, expires_at: data.expires_at }
   }
 
-  return refreshSpotifyToken(supabase, userId, data.refresh_token)
+  const refreshed = await refreshSpotifyToken(supabase, userId, data.refresh_token)
+  if (!refreshed) return null
+  // Re-read so we get the rotated expires_at written by the refresh
+  const { data: fresh } = await supabase
+    .from('spotify_tokens')
+    .select('access_token, expires_at')
+    .eq('user_id', userId)
+    .single<{ access_token: string; expires_at: string }>()
+  if (!fresh) return null
+  return { access_token: fresh.access_token, expires_at: fresh.expires_at }
 }
 
 // Module-level dedup map — if a refresh is already in-flight for a userId,
