@@ -474,28 +474,34 @@ export default function Stage({
     const amb       = scene.tracks.filter(t => t.kind === 'ambience' && !t.spotify_uri)
     sceneMusicRef.current = scene.tracks.filter(t => t.kind === 'music')
 
-    baseMusic.forEach((t, i) => {
-      const a = getOrCreate(t)
-      if (i === 0 && (t.signed_url || t.url)) a.play().catch(() => {})
-    })
-    layers.forEach(t => {
-      if (t.signed_url || t.url) getOrCreate(t).play().catch(() => {})
-    })
-    // Ambience: viewer is audio master when live
+    // Viewer is the sole audio master during live presentation. Don't
+    // start any DM audio on scene change — the going-live effect would
+    // pause it again immediately, and pre-creating the audio elements
+    // means the next non-live scene change has stale refs to dispose.
     if (!isLive) {
+      baseMusic.forEach((t, i) => {
+        const a = getOrCreate(t)
+        if (i === 0 && (t.signed_url || t.url)) a.play().catch(() => {})
+      })
+      layers.forEach(t => {
+        if (t.signed_url || t.url) getOrCreate(t).play().catch(() => {})
+      })
       amb.forEach(t => {
         if (t.signed_url || t.url) getOrCreate(t).play().catch(() => {})
       })
     }
   }, [scene?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Stop ambience on DM whenever presentation goes live;
-  // resume it when the presentation stops.
+  // Silence the DM the moment the presentation goes live — the viewer is the
+  // sole audio master while presenting (Spotify especially: both DM + viewer
+  // share one playback context, so any DM playback fights the viewer for the
+  // active device). Resume ambience when the presentation stops; leave music
+  // and layers paused so the DM can choose what to bring back manually.
   useEffect(() => {
     if (!isLive) {
       // Going not-live: resume any ambience that was running before.
       // Only touch elements that already exist in audioRefs — new-scene
-      // autoplay is handled by the 300ms timer so we don't double-start on mount.
+      // autoplay is handled by the scene-change effect so we don't double-start on mount.
       const ambTracks = (scene?.tracks || []).filter(t => t.kind === 'ambience' && !t.spotify_uri)
       ambTracks.forEach(t => {
         const a = audioRefs.current[t.id]
@@ -503,17 +509,17 @@ export default function Stage({
       })
       return
     }
-    const ambTracks = (scene?.tracks || []).filter(t => t.kind === 'ambience')
-    ambTracks.forEach(t => {
-      const a = audioRefs.current[t.id]
-      if (a) { a.pause(); a.currentTime = 0 }
+    // Going live: pause every file track (music, layers, ambience).
+    Object.values(audioRefs.current).forEach(a => {
+      if (!a.paused) { a.pause(); a.currentTime = 0 }
     })
-    // Force-sync mixer UI immediately — the 'pause' DOM event fires
-    // asynchronously, so without this the mixer stays "playing" until
-    // the next render cycle after the event ticks.
+    // Stop Spotify — disableAutoPlay only blocks new auto-starts; existing
+    // playback keeps going on the DM device unless we tell it to stop.
+    spotify.stopAll()
+    // Force-sync mixer UI immediately — DOM 'pause' events fire async.
     setPlaying(p => {
-      const next = { ...p }
-      ambTracks.forEach(t => { next[t.id] = false })
+      const next: Record<string, boolean> = {}
+      Object.keys(p).forEach(id => { next[id] = false })
       return next
     })
   }, [isLive]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -581,6 +587,15 @@ export default function Stage({
   }
 
   function toggleTrack(t: Track) {
+    // During live, the viewer is the sole audio master. Local playback on
+    // the DM stage would conflict — and for Spotify it actively steals the
+    // playback device from the viewer. The mixer's music row doubles as a
+    // "switch viewer's active track" control via onMusicTrackChange; layers
+    // and ambience have no per-track live channel, so the click is a no-op.
+    if (isLive) {
+      if (t.kind === 'music') onMusicTrackChange?.(t.id)
+      return
+    }
     if (t.spotify_uri) { spotify.toggle(t); return }
     const a = getOrCreate(t)
     if (a.paused) { a.play().catch(() => {}) } else { a.pause() }
@@ -738,25 +753,26 @@ export default function Stage({
     if (newIdx < 0 || newIdx >= baseTracks.length || newIdx === musicIdx) return
     const current = baseTracks[musicIdx]
     const next    = baseTracks[newIdx]
-    if (current) {
-      if (!current.spotify_uri) {
-        const a = audioRefs.current[current.id]
-        if (a) { a.pause(); a.currentTime = 0 }
-      } else if (spotify.states[current.id]?.playing) {
-        // Always pause the outgoing Spotify track on a manual switch — even
-        // when live. The disableAutoPlay guard exists for auto-start only;
-        // an explicit user switch must clean up audio it can hear locally.
-        spotify.toggle(current)
+    // During live, the viewer drives playback. We just push the track ID and
+    // skip every local play/pause — going live already silenced the DM, and
+    // local play would re-steal the Spotify device from the viewer.
+    if (!isLive) {
+      if (current) {
+        if (!current.spotify_uri) {
+          const a = audioRefs.current[current.id]
+          if (a) { a.pause(); a.currentTime = 0 }
+        } else if (spotify.states[current.id]?.playing) {
+          spotify.toggle(current)
+        }
       }
-    }
-    if (next) {
-      if (!next.spotify_uri) {
-        const a = getOrCreate(next)
-        a.volume = volumes[next.id] ?? a.volume
-        a.play().catch(() => {})
-      } else if (!isLive && !spotify.states[next.id]?.playing) {
-        // When live, viewer receives the track ID via active_music_track_id and plays it
-        spotify.toggle(next)
+      if (next) {
+        if (!next.spotify_uri) {
+          const a = getOrCreate(next)
+          a.volume = volumes[next.id] ?? a.volume
+          a.play().catch(() => {})
+        } else if (!spotify.states[next.id]?.playing) {
+          spotify.toggle(next)
+        }
       }
     }
     setMusicIdx(newIdx)

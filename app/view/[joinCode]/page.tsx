@@ -63,7 +63,15 @@ export default function ViewerPage() {
     right:  { zoom: 1, panX: 50, panY: 100, flipped: false, aboveOverlay: false },
   })
 
+  // Skip the character fetch when the JSON-serialized state is unchanged.
+  // The realtime channel fires this on every session UPDATE (handout/overlay/
+  // music too), so without a guard we'd re-fetch all three characters on every
+  // tweak — and the periodic resync poll would do the same every cycle.
+  const lastCharStateKeyRef = useRef<string | null>(null)
   const loadCharactersFromState = useCallback(async (state: CharacterState | null) => {
+    const key = state ? JSON.stringify(state) : ''
+    if (lastCharStateKeyRef.current === key) return
+    lastCharStateKeyRef.current = key
     const seq = ++charLoadSeqRef.current
     if (!state) {
       setCharacters({ left: null, center: null, right: null })
@@ -119,6 +127,9 @@ export default function ViewerPage() {
   useEffect(() => { campaignSoundsRef.current = campaignSounds }, [campaignSounds])
   const lastSfxEventIdRef = useRef<string | null>(null)
   const [sessionCampaignId, setSessionCampaignId] = useState<string | null>(null)
+  // Mirror sessionCampaignId in a ref so loadSession can decide whether to
+  // refetch sounds/handouts without depending on state inside the closure.
+  const sessionCampaignIdRef = useRef<string | null>(null)
 
   // ── Campaign Library (campaign-scoped handouts) ──
   // Players browse these themselves — independent of the DM-pushed handout.
@@ -219,7 +230,9 @@ export default function ViewerPage() {
   const [activeOverlays, setActiveOverlays] = useState<Record<string, OverlayLiveState>>({})
 
   // ── Spotify player ────────────────────────────────────────────
-  const spotify = useSpotifyPlayer(scene)
+  // preferredTrackId: when the DM has already chosen a track, autoplay it
+  // directly so we don't briefly play music[0] before switching.
+  const spotify = useSpotifyPlayer(scene, { preferredTrackId: activeMusicTrackId })
 
   // ── Fullscreen ────────────────────────────────────────────────
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -327,7 +340,15 @@ export default function ViewerPage() {
     const startId      = activeMusicTrackIdRef.current
     const musicToStart = (startId ? musicTracks.find(t => t.id === startId) : null) ?? musicTracks[0]
     const tracksToPlay = [...(musicToStart ? [musicToStart] : []), ...alwaysOn]
-    if (!tracksToPlay.length) return
+    const hasSpotify   = scene.tracks.some(t => !!t.spotify_uri)
+
+    // Spotify-only scenes: no file tracks to autoplay against, but the SDK
+    // still won't make sound until the page receives a user gesture. Surface
+    // the tap overlay so the viewer can unlock playback.
+    if (!tracksToPlay.length) {
+      if (hasSpotify && !hasInteracted.current) setNeedsTap(true)
+      return
+    }
 
     if (hasInteracted.current) {
       tracksToPlay.forEach(t => {
@@ -409,6 +430,9 @@ export default function ViewerPage() {
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load session ──────────────────────────────────────────────
+  // Idempotent: safe to call repeatedly (initial mount, visibility resume,
+  // periodic resync). Skips the expensive scene reload when active_scene_id
+  // hasn't changed so a resync doesn't churn audio refs / overlay state.
   const loadSession = useCallback(async () => {
     const { data } = await supabase.from('sessions')
       .select('id, campaign_id, active_scene_id, is_live, character_state, active_handout_id, active_music_track_id, active_overlays, active_sfx_event')
@@ -416,15 +440,21 @@ export default function ViewerPage() {
     if (!data)         { setStatus('waiting'); return }
     if (!data.is_live) { setStatus('ended');   return }
     const sessionOverlays = (data.active_overlays ?? {}) as Record<string, OverlayLiveState>
-    await Promise.all([
-      loadScene(data.active_scene_id, sessionOverlays),
-      loadCharactersFromState(data.character_state as CharacterState | null),
-    ])
+    const sceneChanged = data.active_scene_id !== sceneRef.current?.id
+    if (sceneChanged) {
+      await loadScene(data.active_scene_id, sessionOverlays)
+    } else if (data.active_overlays) {
+      setActiveOverlays(data.active_overlays as Record<string, OverlayLiveState>)
+    }
+    await loadCharactersFromState(data.character_state as CharacterState | null)
     setActiveHandoutId(data.active_handout_id ?? null)
     setActiveMusicTrackId(data.active_music_track_id ?? null)
     // Soundboard + Library: fetch campaign-scoped data so SFX events resolve
-    // and the library button has its handouts ready.
-    if (data.campaign_id) {
+    // and the library button has its handouts ready. Only on first load /
+    // campaign change — the per-campaign realtime subscriptions below keep
+    // these in sync afterward, so the live-resync poll skips this work.
+    if (data.campaign_id && data.campaign_id !== sessionCampaignIdRef.current) {
+      sessionCampaignIdRef.current = data.campaign_id
       setSessionCampaignId(data.campaign_id)
       const [{ data: sounds }, { data: handouts }] = await Promise.all([
         supabase.from('campaign_sounds').select('*').eq('campaign_id', data.campaign_id).order('order_index'),
@@ -444,6 +474,42 @@ export default function ViewerPage() {
   useEffect(() => {
     if (status !== 'waiting') return
     const t = setInterval(loadSession, 6000)
+    return () => clearInterval(t)
+  }, [status, loadSession])
+
+  // Recover from a silently-dropped Realtime channel. When the tab goes
+  // background the websocket can stop receiving postgres_changes events;
+  // resuming the tab or coming back online doesn't always replay the missed
+  // updates. Re-fetch session state on visibility/online so the viewer
+  // catches up without a full reload. This deliberately does NOT touch the
+  // channel subscription (touching it churns the SDK — see #99 revert).
+  // Stable deps via useCallback singleton supabase keep this from re-binding.
+  useEffect(() => {
+    function onResume() {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      loadSession()
+    }
+    function onOnline() { loadSession() }
+    document.addEventListener('visibilitychange', onResume)
+    window.addEventListener('online', onOnline)
+    return () => {
+      document.removeEventListener('visibilitychange', onResume)
+      window.removeEventListener('online', onOnline)
+    }
+  }, [loadSession])
+
+  // Belt-and-suspenders resync while live. The Realtime channel can silently
+  // stall while the tab is foregrounded (server-side disconnect, transient
+  // network blip the SDK doesn't surface). loadSession is now idempotent —
+  // it skips the scene reload + character fetch when nothing changed — so a
+  // 15s poll catches DM scene switches the channel missed without disrupting
+  // playback when state is steady.
+  useEffect(() => {
+    if (status !== 'live') return
+    const t = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      loadSession()
+    }, 15000)
     return () => clearInterval(t)
   }, [status, loadSession])
 

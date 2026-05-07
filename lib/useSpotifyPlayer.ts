@@ -96,7 +96,10 @@ async function applyRepeatMode(
   ).catch(() => {})
 }
 
-export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false } = {}): SpotifyPlayerApi {
+export function useSpotifyPlayer(
+  scene: Scene | null,
+  { disableAutoPlay = false, preferredTrackId = null }: { disableAutoPlay?: boolean; preferredTrackId?: string | null } = {},
+): SpotifyPlayerApi {
   const playerRef      = useRef<SpotifySdkPlayer | null>(null)
   const deviceIdRef    = useRef<string | null>(null)
   const activeTrackRef = useRef<Track | null>(null)
@@ -149,15 +152,18 @@ export function useSpotifyPlayer(scene: Scene | null, { disableAutoPlay = false 
   // device; if both auto-play on scene change they race — last write wins
   // and the wrong device may end up with audio. The DM can still manually
   // toggle tracks from the mixer.
+  // preferredTrackId lets callers (the viewer) specify the DM-selected track
+  // up-front so we don't briefly play music[0] then switch.
   useEffect(() => {
     if (disableAutoPlay || !connected || !scene?.id) return
     const music = spotifyTracks.filter(
       t => t.kind === 'music' || t.kind === 'ml2' || t.kind === 'ml3'
     )
     if (!music.length) return
-    const timer = setTimeout(() => { playTrack(music[0]).catch(() => {}) }, 350)
+    const target = (preferredTrackId ? music.find(t => t.id === preferredTrackId) : null) ?? music[0]
+    const timer = setTimeout(() => { playTrack(target).catch(() => {}) }, 350)
     return () => clearTimeout(timer)
-  }, [scene?.id, connected, disableAutoPlay]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scene?.id, connected, disableAutoPlay, preferredTrackId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Progress polling (500ms) ──────────────────────────────────
   // player_state_changed alone isn't frequent enough for a smooth bar.

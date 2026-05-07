@@ -62,9 +62,18 @@ export default function AppPage() {
   })
   const [activeOverlays, setActiveOverlays] = useState<Record<string, OverlayLiveState>>({})
   const overlayDbTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Clear the overlay debounce timer on unmount so it doesn't fire a stale DB
-  // write after the user signs out or navigates away.
-  useEffect(() => () => { if (overlayDbTimerRef.current) clearTimeout(overlayDbTimerRef.current) }, [])
+  // Slider drags on character framing fire onChange ~60×/sec — debounce
+  // the DB write so we send one UPDATE per gesture instead of stomping the
+  // viewer with realtime events. The pending payload lives in a ref so the
+  // timer always flushes the latest values, not those captured at schedule.
+  const charStateDbTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingCharStateRef = useRef<CharacterState | null>(null)
+  // Clear pending timers on unmount so a stale write doesn't fire after the
+  // user signs out or navigates away.
+  useEffect(() => () => {
+    if (overlayDbTimerRef.current)   clearTimeout(overlayDbTimerRef.current)
+    if (charStateDbTimerRef.current) clearTimeout(charStateDbTimerRef.current)
+  }, [])
 
   // ── Undo-delete: scene removed from UI immediately, DB delete after 5s ──
   interface PendingSceneDelete { scene: Scene; insertAfterId: string | null; timer: ReturnType<typeof setTimeout> }
@@ -276,8 +285,10 @@ export default function AppPage() {
     if (isLive && sessionId) {
       // Cancel any pending debounced overlay write — its `next` was computed
       // for the OLD scene and would clobber the active_overlays:null we're
-      // about to write for the NEW scene.
+      // about to write for the NEW scene. Same for character framing.
       if (overlayDbTimerRef.current) { clearTimeout(overlayDbTimerRef.current); overlayDbTimerRef.current = null }
+      if (charStateDbTimerRef.current) { clearTimeout(charStateDbTimerRef.current); charStateDbTimerRef.current = null }
+      pendingCharStateRef.current = null
       // Clear character state when switching scenes — DM places characters
       // manually on the stage rather than auto-loading saved assignments.
       const cs: CharacterState = {
@@ -310,6 +321,11 @@ export default function AppPage() {
     setSlotDisplayProps(newDisplay)
     setActiveCharacters(chars)
     if (isLive && sessionId) {
+      // Placement changes the character identity in a slot — flush any
+      // pending debounced framing write so the immediate placement update
+      // doesn't get clobbered by a stale slider write 150ms later.
+      if (charStateDbTimerRef.current) { clearTimeout(charStateDbTimerRef.current); charStateDbTimerRef.current = null }
+      pendingCharStateRef.current = null
       const cs: CharacterState = {
         left: chars.left?.id || null, center: chars.center?.id || null, right: chars.right?.id || null,
         leftScale: newScales.left, centerScale: newScales.center, rightScale: newScales.right,
@@ -323,7 +339,7 @@ export default function AppPage() {
     }
   }
 
-  async function handleSlotDisplayChange(
+  function handleSlotDisplayChange(
     slot: 'left' | 'center' | 'right',
     scale: number,
     display: { zoom?: number; panX?: number; panY?: number; flipped?: boolean; aboveOverlay?: boolean }
@@ -332,18 +348,27 @@ export default function AppPage() {
     const newDisplay = { ...slotDisplayProps, [slot]: display }
     setSlotScales(newScales)
     setSlotDisplayProps(newDisplay)
-    if (isLive && sessionId) {
-      const cs: CharacterState = {
-        left: activeCharacters.left?.id || null, center: activeCharacters.center?.id || null, right: activeCharacters.right?.id || null,
-        leftScale: newScales.left, centerScale: newScales.center, rightScale: newScales.right,
-        leftZoom: newDisplay.left.zoom, centerZoom: newDisplay.center.zoom, rightZoom: newDisplay.right.zoom,
-        leftPanX: newDisplay.left.panX, centerPanX: newDisplay.center.panX, rightPanX: newDisplay.right.panX,
-        leftPanY: newDisplay.left.panY, centerPanY: newDisplay.center.panY, rightPanY: newDisplay.right.panY,
-        leftFlipped: newDisplay.left.flipped, centerFlipped: newDisplay.center.flipped, rightFlipped: newDisplay.right.flipped,
-        leftAboveOverlay: newDisplay.left.aboveOverlay, centerAboveOverlay: newDisplay.center.aboveOverlay, rightAboveOverlay: newDisplay.right.aboveOverlay,
-      }
-      await supabase.from('sessions').update({ character_state: cs }).eq('id', sessionId)
+    if (!isLive || !sessionId) return
+    pendingCharStateRef.current = {
+      left: activeCharacters.left?.id || null, center: activeCharacters.center?.id || null, right: activeCharacters.right?.id || null,
+      leftScale: newScales.left, centerScale: newScales.center, rightScale: newScales.right,
+      leftZoom: newDisplay.left.zoom, centerZoom: newDisplay.center.zoom, rightZoom: newDisplay.right.zoom,
+      leftPanX: newDisplay.left.panX, centerPanX: newDisplay.center.panX, rightPanX: newDisplay.right.panX,
+      leftPanY: newDisplay.left.panY, centerPanY: newDisplay.center.panY, rightPanY: newDisplay.right.panY,
+      leftFlipped: newDisplay.left.flipped, centerFlipped: newDisplay.center.flipped, rightFlipped: newDisplay.right.flipped,
+      leftAboveOverlay: newDisplay.left.aboveOverlay, centerAboveOverlay: newDisplay.center.aboveOverlay, rightAboveOverlay: newDisplay.right.aboveOverlay,
     }
+    if (charStateDbTimerRef.current) clearTimeout(charStateDbTimerRef.current)
+    charStateDbTimerRef.current = setTimeout(() => {
+      const cs = pendingCharStateRef.current
+      pendingCharStateRef.current = null
+      charStateDbTimerRef.current = null
+      if (!cs) return
+      void reportDbError(
+        supabase.from('sessions').update({ character_state: cs }).eq('id', sessionId),
+        'Failed to update character framing for viewers.',
+      )
+    }, 150)
   }
 
   async function handleSaveSlotDisplay(slot: 'left' | 'center' | 'right') {
