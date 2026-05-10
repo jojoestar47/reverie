@@ -216,18 +216,37 @@ export function useSpotifyPlayer(
   // device; if both auto-play on scene change they race — last write wins
   // and the wrong device may end up with audio. The DM can still manually
   // toggle tracks from the mixer.
-  // preferredTrackId lets callers (the viewer) specify the DM-selected track
-  // up-front so we don't briefly play music[0] then switch.
+  //
+  // preferredTrackId lets callers (the viewer) specify the DM-selected
+  // track up-front so on initial connect we play the right one. It's read
+  // through a ref so a *change* in preferredTrackId doesn't re-fire this
+  // effect — that was the bug behind "plays for a second and then
+  // restarts": each DM-initiated track switch updates preferredTrackId,
+  // which used to re-trigger this effect, which scheduled a duplicate
+  // playTrack() 350ms later. Spotify's /me/player/play with the same URI
+  // restarts the track from the beginning, so the listener heard the new
+  // track for ~350ms (until the timer fired) and then it restarted.
+  //
+  // The activeTrackRef guard inside the timer is a second line of defense:
+  // even if this effect somehow re-fires while a track is playing, we
+  // don't clobber it with another playTrack(). fadeTo()/toggle() set
+  // activeTrackRef when they kick off playback, so we can detect it.
+  const preferredTrackIdRef = useRef(preferredTrackId)
+  useEffect(() => { preferredTrackIdRef.current = preferredTrackId }, [preferredTrackId])
+
   useEffect(() => {
     if (disableAutoPlay || !connected || !scene?.id) return
     const music = spotifyTracks.filter(
       t => t.kind === 'music' || t.kind === 'ml2' || t.kind === 'ml3'
     )
     if (!music.length) return
-    const target = (preferredTrackId ? music.find(t => t.id === preferredTrackId) : null) ?? music[0]
-    const timer = setTimeout(() => { playTrack(target).catch(() => {}) }, 350)
+    const target = (preferredTrackIdRef.current ? music.find(t => t.id === preferredTrackIdRef.current) : null) ?? music[0]
+    const timer = setTimeout(() => {
+      if (activeTrackRef.current) return
+      playTrack(target).catch(() => {})
+    }, 350)
     return () => clearTimeout(timer)
-  }, [scene?.id, connected, disableAutoPlay, preferredTrackId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scene?.id, connected, disableAutoPlay]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Progress polling (500ms) ──────────────────────────────────
   // player_state_changed alone isn't frequent enough for a smooth bar.
@@ -371,10 +390,21 @@ export function useSpotifyPlayer(
     }
 
     const sceneIdAtStart = prevSceneIdRef.current
+    // Claim the active-track slot up-front so concurrent calls (the
+    // auto-play timer racing with a user-initiated fadeTo, both targeting
+    // tracks in the same scene) check activeTrackRef and skip. Without
+    // this, both call /me/player/play in quick succession and Spotify
+    // restarts the second URI — that was the "starts for a second and
+    // then restarts" symptom. We restore the previous value if the network
+    // operation fails or the scene changes mid-flight.
+    const previousActive = activeTrackRef.current
+    activeTrackRef.current = t
 
     const token = await fetchToken()
-    if (!token) return
-    if (prevSceneIdRef.current !== sceneIdAtStart) return
+    if (!token || prevSceneIdRef.current !== sceneIdAtStart) {
+      activeTrackRef.current = previousActive
+      return
+    }
 
     const body = t.spotify_type === 'playlist'
       ? { context_uri: t.spotify_uri }
@@ -392,9 +422,10 @@ export function useSpotifyPlayer(
     // 204 = success, 202 = accepted (device waking up) — anything else is a
     // real failure. Don't update local state if Spotify rejected the request,
     // or we'd show the track as playing when nothing is audible.
-    if (!playRes.ok && playRes.status !== 202) return
-
-    if (prevSceneIdRef.current !== sceneIdAtStart) return
+    if ((!playRes.ok && playRes.status !== 202) || prevSceneIdRef.current !== sceneIdAtStart) {
+      activeTrackRef.current = previousActive
+      return
+    }
 
     await applyRepeatMode(
       loopRef.current[t.id] ?? false,
@@ -403,7 +434,6 @@ export function useSpotifyPlayer(
       token
     )
 
-    activeTrackRef.current = t
     setProgress(0)
 
     // initialVolume lets fadeTo() start the track silenced and ramp it up
