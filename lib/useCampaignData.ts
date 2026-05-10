@@ -118,6 +118,14 @@ interface Options {
    * we surface this as a callback rather than driving the state from here.
    */
   onActiveSceneIdChange?: (id: string) => void
+  /**
+   * Called on session load and on Realtime updates with the current
+   * active_music_track_id. Lets multi-tab DM sessions stay in sync — without
+   * this, Tab A switching the music track wouldn't update Tab B's mixer UI,
+   * and Tab B's prev/next buttons would compute next-index from a stale
+   * starting point.
+   */
+  onActiveMusicTrackIdChange?: (id: string | null) => void
 }
 
 export function useCampaignData(activeCampId: string, opts: Options = {}): UseCampaignData {
@@ -151,12 +159,14 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
   useEffect(() => { campaignCharactersRef.current = campaignCharacters }, [campaignCharacters])
 
   // Stable refs to callbacks — callers may not memoize.
-  const onSignedOutRef           = useRef(opts.onSignedOut)
-  const flushPendingDeletesRef   = useRef(opts.flushPendingDeletes)
-  const onActiveSceneIdChangeRef = useRef(opts.onActiveSceneIdChange)
-  useEffect(() => { onSignedOutRef.current           = opts.onSignedOut })
-  useEffect(() => { flushPendingDeletesRef.current   = opts.flushPendingDeletes })
-  useEffect(() => { onActiveSceneIdChangeRef.current = opts.onActiveSceneIdChange })
+  const onSignedOutRef                = useRef(opts.onSignedOut)
+  const flushPendingDeletesRef        = useRef(opts.flushPendingDeletes)
+  const onActiveSceneIdChangeRef      = useRef(opts.onActiveSceneIdChange)
+  const onActiveMusicTrackIdChangeRef = useRef(opts.onActiveMusicTrackIdChange)
+  useEffect(() => { onSignedOutRef.current                = opts.onSignedOut })
+  useEffect(() => { flushPendingDeletesRef.current        = opts.flushPendingDeletes })
+  useEffect(() => { onActiveSceneIdChangeRef.current      = opts.onActiveSceneIdChange })
+  useEffect(() => { onActiveMusicTrackIdChangeRef.current = opts.onActiveMusicTrackIdChange })
 
   // ── Auth: redirect on sign-out from another tab ──
   // Without this the page silently continues showing stale data. We've seen
@@ -283,7 +293,7 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
   // ── Live session: load existing + clear stale character state ──
   const loadSession = useCallback(async (campId: string) => {
     const { data } = await supabase.from('sessions')
-      .select('id, join_code, active_scene_id, is_live, character_state')
+      .select('id, join_code, active_scene_id, active_music_track_id, is_live, character_state')
       .eq('campaign_id', campId).eq('is_live', true).maybeSingle()
     if (data) {
       setSessionId(data.id); setJoinCode(data.join_code); setIsLive(true)
@@ -292,6 +302,10 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
       // a live session wouldn't auto-jump to the saved active scene until
       // someone updated the session row from another tab.
       if (data.active_scene_id) onActiveSceneIdChangeRef.current?.(data.active_scene_id)
+      // Same reasoning for the music track — needed so a DM rejoining a live
+      // session sees the correct "current" track in their mixer instead of
+      // defaulting to track index 0.
+      onActiveMusicTrackIdChangeRef.current?.(data.active_music_track_id ?? null)
       // Clear stale character state in DB — characters are placed manually each session.
       // Without this, the viewer shows leftover characters from before a page refresh.
       const cs: CharacterState = {
@@ -340,11 +354,15 @@ export function useCampaignData(activeCampId: string, opts: Options = {}): UseCa
       .on('postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `id=eq.${sessionId}` },
         payload => {
-          const row = payload.new as { active_scene_id: string | null; is_live: boolean; character_state: CharacterState | null }
+          const row = payload.new as { active_scene_id: string | null; active_music_track_id: string | null; is_live: boolean; character_state: CharacterState | null }
           if (!row.is_live) { setIsLive(false); setSessionId(null); setJoinCode(null); return }
           // activeSceneId is owned by the page (UI state) — surface scene
           // changes via callback so multi-tab DM sessions stay in sync.
           if (row.active_scene_id) onActiveSceneIdChangeRef.current?.(row.active_scene_id)
+          // Music track changes from another tab so the mixer's "current
+          // track" badge stays accurate. Pass through nulls too — a scene
+          // change clears the field, and Tab B needs to mirror that.
+          onActiveMusicTrackIdChangeRef.current?.(row.active_music_track_id ?? null)
           if (row.character_state) syncCharacterState(row.character_state)
         }
       ).subscribe()

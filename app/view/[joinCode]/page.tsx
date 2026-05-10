@@ -86,7 +86,7 @@ export default function ViewerPage() {
   }, [supabase])
 
   // ── Audio ─────────────────────────────────────────────────────
-  type Handlers = { play: () => void; pause: () => void }
+  type Handlers = { play: () => void; pause: () => void; ended?: () => void }
   const audioRefs             = useRef<Record<string, HTMLAudioElement>>({})
   const audioHandlers         = useRef<Record<string, Handlers>>({})
   // Tracks the in-flight music-track crossfade so a rapid second switch
@@ -131,6 +131,7 @@ export default function ViewerPage() {
       if (h) {
         a.removeEventListener('play',  h.play)
         a.removeEventListener('pause', h.pause)
+        if (h.ended) a.removeEventListener('ended', h.ended)
       }
       a.pause(); a.src = ''
     })
@@ -262,7 +263,28 @@ export default function ViewerPage() {
       const pauseHandler = () => setPlaying(p => ({ ...p, [t.id]: false }))
       a.addEventListener('play',  playHandler)
       a.addEventListener('pause', pauseHandler)
-      audioHandlers.current[t.id] = { play: playHandler, pause: pauseHandler }
+
+      // Auto-advance for non-loop music tracks. Without this, when a music
+      // track finishes during a live presentation it just stops — the DM
+      // can't intervene because their audio is paused (viewer is the audio
+      // master) so their `ended` listener never fires either. We advance
+      // locally on the viewer; if the DM has cross-tab sync wired up they
+      // see the new active_music_track_id, otherwise the DM mixer lags
+      // until the DM clicks a track. Loop tracks auto-loop natively and
+      // never fire `ended`, so this only kicks in for the multi-track case.
+      let endedHandler: (() => void) | undefined
+      if (t.kind === 'music' && !t.loop) {
+        endedHandler = () => {
+          const allMusic = (sceneRef.current?.tracks ?? []).filter(x => x.kind === 'music')
+          if (allMusic.length <= 1) return
+          const currentIdx = allMusic.findIndex(x => x.id === t.id)
+          if (currentIdx < 0) return
+          const next = allMusic[(currentIdx + 1) % allMusic.length]
+          if (next) setActiveMusicTrackId(next.id)
+        }
+        a.addEventListener('ended', endedHandler)
+      }
+      audioHandlers.current[t.id] = { play: playHandler, pause: pauseHandler, ended: endedHandler }
       audioRefs.current[t.id] = a
       setVolumes(v => ({ ...v, [t.id]: vol }))
     }

@@ -61,6 +61,11 @@ export default function AppPage() {
     right:  DEFAULT_SLOT_DISPLAY,
   })
   const [activeOverlays, setActiveOverlays] = useState<Record<string, OverlayLiveState>>({})
+  // Mirrors sessions.active_music_track_id so the Stage mixer can show the
+  // truly-playing track during live (not just index 0 after every scene
+  // change) AND so multiple DM tabs stay in sync. useCampaignData fires
+  // onActiveMusicTrackIdChange on session load and on Realtime UPDATEs.
+  const [activeMusicTrackId, setActiveMusicTrackId] = useState<string | null>(null)
   const overlayDbTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Slider drags on character framing fire onChange ~60×/sec — debounce
   // the DB write so we send one UPDATE per gesture instead of stomping the
@@ -138,6 +143,7 @@ export default function AppPage() {
       setCampView('stage')
     },
     onActiveSceneIdChange: id => setActiveSceneId(id),
+    onActiveMusicTrackIdChange: id => setActiveMusicTrackId(id),
   })
   const {
     campaigns, scenes, folders, campaignCharacters, campaignTags, campaignSounds, campaignHandouts, loading,
@@ -258,6 +264,9 @@ export default function AppPage() {
 
   async function handleMusicTrackChange(trackId: string | null) {
     if (!sessionId || !isLive) return
+    // Optimistic local update so the mixer reflects the click immediately
+    // instead of waiting for the Realtime echo (~50–200ms RTT).
+    setActiveMusicTrackId(trackId)
     await reportDbError(
       supabase.from('sessions').update({ active_music_track_id: trackId }).eq('id', sessionId),
       'Failed to update music track for viewers.',
@@ -328,6 +337,10 @@ export default function AppPage() {
         leftFlipped: false, centerFlipped: false, rightFlipped: false,
         leftAboveOverlay: false, centerAboveOverlay: false, rightAboveOverlay: false,
       }
+      // Optimistic local clear matches the DB reset below — keeps the
+      // Stage mixer from briefly showing the previous scene's track as
+      // "current" while the Realtime UPDATE round-trips.
+      setActiveMusicTrackId(null)
       const { error } = await supabase.from('sessions').update({ active_scene_id: id, character_state: cs, active_music_track_id: null, active_handout_id: null, active_overlays: null }).eq('id', sessionId)
       if (error) showError('Failed to switch scene for viewers.')
     }
@@ -949,6 +962,7 @@ export default function AppPage() {
               onSaveSlotDisplay={handleSaveSlotDisplay}
               onHandoutShow={handleHandoutShow}
               onMusicTrackChange={handleMusicTrackChange}
+              activeMusicTrackId={activeMusicTrackId}
               isLive={isLive}
               activeOverlays={activeOverlays}
               onOverlayStateChange={handleOverlayStateChange}
