@@ -573,14 +573,14 @@ export default function Stage({
   function getOrCreate(t: Track): HTMLAudioElement {
     if (t.spotify_uri) return new Audio() // never used — Spotify tracks go through SDK
     if (!audioRefs.current[t.id]) {
-      // preload MUST be set before src — browsers honor preload at load-start.
-      // Setting `new Audio(src)` first kicks off the load at the default
-      // 'metadata' level, and a later `a.preload = 'auto'` can't upgrade the
-      // in-flight request. The result is buffer underruns when the user
-      // switches tracks. See viewer page for the full rationale.
+      // preload + explicit load() to actually buffer the file. See viewer's
+      // getOrCreate for the rationale: preload alone is just a hint browsers
+      // can ignore, and the default load level ('metadata') doesn't actually
+      // pre-download. Setting preload before src and calling load() forces it.
       const a = new Audio()
       a.preload = 'auto'
       a.src = t.signed_url || t.url || ''
+      a.load()
       a.loop = t.loop; a.muted = muted
       let vol = t.volume
       if (scene?.id) {

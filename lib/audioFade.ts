@@ -58,7 +58,19 @@ export function crossfadeAudio(
       if (fi >= steps) {
         if (fromInterval) clearInterval(fromInterval)
         fromInterval = null
-        try { from.pause(); from.currentTime = 0 } catch {}
+        try {
+          from.pause()
+          // Only rewind if the track has actually finished. If the user
+          // switched away mid-track, leave currentTime alone — switching
+          // back resumes from where they paused, AND we avoid forcing a
+          // seek-to-0 which on some browsers (esp. mobile) causes a fresh
+          // byte-range fetch even though the data is already buffered.
+          // That fetch is part of the "going back and forth is not smooth"
+          // symptom.
+          if (from.duration > 0 && from.currentTime >= from.duration - 0.5) {
+            from.currentTime = 0
+          }
+        } catch {}
         from.volume = clamp01(startFromVol)
         fromDone = true
         maybeFinish()
@@ -89,9 +101,14 @@ export function crossfadeAudio(
       }, STEP_MS)
     }
 
-    // readyState 3 = HAVE_FUTURE_DATA, 4 = HAVE_ENOUGH_DATA — either is
-    // enough to start playback without an immediate buffer underrun.
-    if (to.readyState >= 3) {
+    // Only HAVE_ENOUGH_DATA (readyState 4) is safe to play without buffer
+    // underruns. HAVE_FUTURE_DATA (3) means "we have a tiny bit, enough to
+    // play right now" — but the browser will run dry seconds later and
+    // stall. The `canplaythrough` event fires when readyState reaches 4,
+    // which is the same condition. (The previous code used `>= 3` and that
+    // was the bug — listeners heard play→stall→play→stall, the "struggling
+    // to fetch" symptom.)
+    if (to.readyState >= 4) {
       startToFade()
     } else {
       onReady = () => {
@@ -101,14 +118,16 @@ export function crossfadeAudio(
         startToFade()
       }
       to.addEventListener('canplaythrough', onReady)
-      // Safety: if canplaythrough never fires (e.g. source unreachable),
-      // fall through after a short wait so we don't hang silently.
+      // 5s timeout for the worst case: file unreachable, network dead, or a
+      // long file that keeps incrementally loading without ever reaching
+      // canplaythrough. Better to attempt play and let the browser do its
+      // best than to hang forever in silence.
       readyTimer = setTimeout(() => {
         if (onReady && to) to.removeEventListener('canplaythrough', onReady)
         onReady = null
         readyTimer = null
         startToFade()
-      }, 1500)
+      }, 5000)
     }
   }
 

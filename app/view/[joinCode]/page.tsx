@@ -240,16 +240,19 @@ export default function ViewerPage() {
     if (t.spotify_uri) return new Audio() // Spotify tracks handled by SDK
     if (!audioRefs.current[t.id]) {
       const src = pubUrl({ url: t.url || undefined, storage_path: t.storage_path || undefined }) || ''
-      // preload MUST be set before src — browsers honor preload at load-start.
-      // If we did `new Audio(src)` first, loading would have already begun at
-      // the default 'metadata' level (only enough to know duration), and the
-      // file wouldn't actually pre-download. A subsequent `a.preload = 'auto'`
-      // is too late to upgrade the in-flight load, so when the DM switches to
-      // this track its buffer underruns and the listener hears the audio
-      // play→stall→play→stall ("pauses and unpauses multiple times").
+      // The "audio is struggling to fetch" stutter has two contributors here:
+      //   1. preload must be set BEFORE src or browsers stick with their
+      //      default `metadata` level (no actual buffering). We set it first.
+      //   2. Even with preload='auto', some browsers treat it as a hint and
+      //      do nothing until you call .load() explicitly. We call it.
+      // The third part of the fix is downstream: crossfadeAudio waits for
+      // readyState >= 4 (HAVE_ENOUGH_DATA) before triggering playback, so
+      // even on slow connections we don't start playing into a near-empty
+      // buffer that runs dry seconds later.
       const a   = new Audio()
       a.preload = 'auto'
       a.src     = src
+      a.load()
       a.loop = t.loop; a.muted = mutedRef.current
       let vol = t.volume
       if (scene?.id) {
@@ -393,11 +396,15 @@ export default function ViewerPage() {
       !t.spotify_uri && audioRefs.current[t.id] && !audioRefs.current[t.id].paused
     )
     // Any non-target file music tracks that aren't the outgoing one — pause
-    // them immediately. The outgoing track is faded out by crossfadeAudio.
+    // them immediately. Don't reset currentTime: switching back to that
+    // track later should resume from where it was, and seeking to 0 forces
+    // some browsers to re-fetch the file from scratch even when the start
+    // is already buffered. (See audioFade.ts for the same reasoning on the
+    // outgoing track.)
     allMusic.forEach(t => {
       if (t.spotify_uri || t.id === activeMusicTrackId || t.id === currentFile?.id) return
       const a = audioRefs.current[t.id]
-      if (a && !a.paused) { a.pause(); a.currentTime = 0 }
+      if (a && !a.paused) a.pause()
     })
 
     if (targetTrack.spotify_uri) {
